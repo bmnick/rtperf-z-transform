@@ -2,15 +2,13 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <unistd.h>
+#include <semaphore.h>
 
 #include <sys/neutrino.h>
 #include <sys/mman.h>
 #include <hw/inout.h>
 
-//TODO: Get ATD working periodically (thread/auto) -> dump into shared filterData
-//TODO: Make thread +semaphore for filter
-//TODO: Make thread +semaphore for output
-//TODO: Make user input thread (Setpoint, P, I, D)
+//TODO: Get ATD working periodically (thread/auto) -> dump into shared filter_data
 //TODO: Write input and output values to CSV
 //TODO: Get CSPS running with step, etc.
 //TODO:
@@ -43,6 +41,52 @@
 
 #define DA_MSB_CHANNEL_0 (0x0000)
 
+
+/**
+ * Ongoing Filter Data struct
+ */
+typedef struct{ //0 is current time
+	double E[3]; //error (input to filter
+	double U[3]; //output
+} filter_data;
+
+/**
+ * Coefficient struct
+ */
+typedef struct{
+	double p,i,d;
+	double setpoint;
+} coefs; 
+
+/**
+ * Data struct required by input thread
+ */
+typedef struct{
+	sem_t * write_lock;
+	coefs * coefficient_struct
+} input_thread_params;
+
+/**
+ * Data struct required by filter thread
+ */
+typedef struct{
+	sem_t * write_lock;
+	coefs * coefficient_struct;
+	filter_data * data_struct;
+	sem_t * input_lock;
+	sem_t * output_lock;
+} filter_thread_params;
+
+/**
+ * Data struct required by output thread
+ */
+typedef struct {
+	sem_t * output_lock;
+	filter_data * data_struct;
+	uintptr_t * handle;
+} output_thread_params;
+
+
 void dac_output(double value, uintptr_t handle) {
 	int output = value / 7 * 2048 + 2048;
 
@@ -57,7 +101,7 @@ void init_adc(uintptr_t handle) {
 	out8(handle+AD_IRC, in8(handle+AD_IRC) & (AD_AINTE_DIS) );
 }
 
-void adc_input(uintptr_t handle, filterData* data) {
+void adc_input(uintptr_t handle, filter_data* data) {
 	out8(handle+DA_CMD, AD_TRIGGER_READ);
 	while(in8(handle+AD_STATUS) & AD_STATUS_STS_MASK){
 		//spin
@@ -66,31 +110,126 @@ void adc_input(uintptr_t handle, filterData* data) {
 
 }
 
-
-typedef struct{ //0 is current time
-	double E[3]; //error (input to filter
-	double U[3]; //output
-}filterData;
-
-typedef struct{
-	double p,i,d;
-	double setpoint;
-}coefs;
-
 /**
  * Applies a filter to the specified data
  *
  */
-int filter(filterData in, coefs c){
-	in.U[0]=in.U[1]+
-			c.p*(in.E[0]-in.E[1])
-			+ c.i*in.E[0]
-			+ c.d*(in.E[0]-(in.E[1]/2)+in.E[2]);
+int filter(filter_data * in, coefs * c){
+	in->U[0] = in->U[1] 
+			 + c->p * ( in->E[0] - in->E[1] )
+			 + c->i * in->E[0]
+			 + c->d * ( in->E[0] - ( in->E[1] / 2 ) + in->E[2] );
 
-	return in.U[0];
+	return in->U[0];
 }
 
+/**
+ * This reads lines in the format "<var> <action> <value>", and action's
+ * var by value.
+ * 
+ * valid vars:
+ * 	p - proportional
+ * 	i - integral
+ *	d - derivative
+ *	s - setpoint
+ *
+ * valid actions
+ *	+ - increment
+ *	- - decrement
+ * 	= - set
+ *
+ * v_params should be a pointer to an input_thread_params struct
+ */
+void * start_input_thread(void * v_params) {
+	input_thread_params * params = (input_thread_params *) v_params;
 
+	char var;
+	char action;
+	double value;
+
+	double * var_to_change;
+
+	while (true) {
+		sem_post(params->write_lock);
+
+		scanf("%c %c %f", &var, &action, &value);
+
+		sem_wait(params->write_lock);
+
+		// Get out the variable
+		switch(var){
+			case 'p': 
+				var_to_change = &(params->coefficient_struct->p); 
+				break;
+			case 'i': 
+				var_to_change = &(params->coefficient_struct->i); 
+				break;
+			case 'd': 
+				var_to_change = &(params->coefficient_struct->d); 
+				break;
+			case 's': 
+				var_to_change = &(params->coefficient_struct->setpoint); 
+				break;
+			default:
+				printf("Invalid variable\n");
+				continue;
+		}
+
+		// Perform the action
+		switch(action) {
+			case '+':
+				*var_to_change += value;
+				break;
+			case '-':
+				*var_to_change -= value;
+				break;
+			case '=':
+				*var_to_change = value;
+				break;
+			default:
+				printf("Invalid action\n");
+				continue;
+		}
+	}
+}
+
+/**
+ * Thread wrapper function for filter thread, just runs filter with 
+ * given parameters
+ *
+ * v_params should be a pointer to a filter_thread_params struct
+ */
+void * start_filter_thread(void * v_params) {
+	filter_thread_params * params = (filter_thread_params *) v_params;
+
+	while(true) {
+		sem_wait(params->input_lock);
+
+		sem_wait(params->write_lock);
+
+		filter(params->data_struct, params->coefficient_struct);
+
+		sem_post(params->write_lock);
+
+		sem_post(params->output_lock);
+	}
+}
+
+/**
+ * Thread wrapper function for output thread, just runs output when
+ * semaphore charged.
+ *
+ * v_params should be a pointer to a output_thread_params struct
+ */
+void * start_output_thread(void * v_params) {
+	output_thread_params * params = (output_thread_params *) v_params;
+
+	while(true) {
+		sem_wait(params->output_lock);
+
+		dac_output(params->data_struct->U[0], params->handle);
+	}
+}
 
 
 int main(int argc, char *argv[]) {
