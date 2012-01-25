@@ -2,16 +2,16 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <unistd.h>
+
+#include <time.h>
+#include <sys/siginfo.h>
+#include <pthread.h>
 #include <semaphore.h>
+
 
 #include <sys/neutrino.h>
 #include <sys/mman.h>
 #include <hw/inout.h>
-
-//TODO: Get ATD working periodically (thread/auto) -> dump into shared filter_data
-//TODO: Write input and output values to CSV
-//TODO: Get CSPS running with step, etc.
-//TODO:
 
 
 #define IO_PORT_SIZE 0xF
@@ -42,53 +42,62 @@
 #define DA_MSB_CHANNEL_0 (0x0000)
 
 
-/**
- * Ongoing Filter Data struct
- */
+
+//TODO: get rid of this
+FILE * f;
+
+
+
 typedef struct{ //0 is current time
 	double E[3]; //error (input to filter
 	double U[3]; //output
-} filter_data;
+}filter_data;
 
-/**
- * Coefficient struct
- */
 typedef struct{
 	double p,i,d;
-	double setpoint;
-} coefs; 
+}coefs;
 
-/**
- * Data struct required by input thread
- */
 typedef struct{
-	sem_t * write_lock;
-	coefs * coefficient_struct
-} input_thread_params;
+	uintptr_t handle;
+	filter_data* data;
+	sem_t* filter_sem;
+	sem_t* DAC_sem;
+	double* setpoint;
 
-/**
- * Data struct required by filter thread
- */
+}adc_args;
+
 typedef struct{
 	sem_t * write_lock;
 	coefs * coefficient_struct;
-	filter_data * data_struct;
-	sem_t * input_lock;
-	sem_t * output_lock;
-} filter_thread_params;
+	double* setpoint;
+}input_thread_args;
 
-/**
- * Data struct required by output thread
- */
-typedef struct {
-	sem_t * output_lock;
-	filter_data * data_struct;
-	uintptr_t * handle;
-} output_thread_params;
+typedef struct{
+	filter_data* data;
+	coefs* coeficients;
+	sem_t* filter_sem;
+	sem_t* write_lock;
+	sem_t* DAC_sem;
+}filter_args;
+
+typedef struct{
+	filter_data* data;
+	uintptr_t handle;
+	sem_t* DAC_sem;
+}dac_args;
 
 
 void dac_output(double value, uintptr_t handle) {
+	if (value > 6.5){
+		value=6.5;
+	}
+	if (value < -6.5){
+		value=-6.5;
+	}
+
 	int output = value / 7 * 2048 + 2048;
+
+	fprintf(f,"%lf \r\n, ",value);
 
 	out8(handle + DA_LSB, output & DA_LSB_MASK);
 	out8(handle + DA_MSB, ((output & DA_MSB_MASK) >> 8) | DA_MSB_CHANNEL_0);
@@ -97,51 +106,119 @@ void dac_output(double value, uintptr_t handle) {
 void init_adc(uintptr_t handle) {
 
 	out8(handle+AD_GAIN, ~(AD_GAIN_SCAN_DIS|AD_GAIN_ZERO));
-
 	out8(handle+AD_IRC, in8(handle+AD_IRC) & (AD_AINTE_DIS) );
+
 }
 
-void adc_input(uintptr_t handle, filter_data* data) {
+
+
+
+double adc_input(uintptr_t handle, filter_data* data) {
 	out8(handle+DA_CMD, AD_TRIGGER_READ);
 	while(in8(handle+AD_STATUS) & AD_STATUS_STS_MASK){
 		//spin
 	}
-	int value = in8(handle+AD_MSB)<< 8 | in8(handle+AD_LSB);
+	signed short value = (in8(handle+AD_MSB)<< 8) + in8(handle+AD_LSB); //signed 16 bit value
 
+	return (double)value/(32767.0)*10.0;//convert to double (voltage)
 }
+
+/**
+ * ADC callback. Function called periodically to scan the ADC and trigger a run of the filter
+ *
+ */
+void adc_callback(param){
+
+	adc_args* args=(adc_args*) param;
+	double input= adc_input(args->handle, args->data);
+
+	args->data->E[2]=args->data->E[1];
+	args->data->E[1]=args->data->E[0];
+	args->data->E[0]=*(args->setpoint)-input;
+
+	fprintf(f,"%f ,", input);
+	fprintf(f,"%f ,", args->data->E[0]);
+
+	//free up the filter semaphore to allow the filter to run to run
+	sem_post(args->filter_sem);
+}
+
+
+
+
 
 /**
  * Applies a filter to the specified data
  *
  */
-int filter(filter_data * in, coefs * c){
-	in->U[0] = in->U[1] 
-			 + c->p * ( in->E[0] - in->E[1] )
-			 + c->i * in->E[0]
-			 + c->d * ( in->E[0] - ( in->E[1] / 2 ) + in->E[2] );
+double filter(filter_data* in, coefs* c){
+
+	in->U[2]=in->U[1];
+	in->U[1]=in->U[0];
+	in->U[0]=in->U[1]+
+			c->p*(in->E[0]-in->E[1])
+			+ c->i*in->E[0]
+			+ c->d*(in->E[0]-(in->E[1]/2)+in->E[2]);
 
 	return in->U[0];
 }
 
 /**
+ * Filter thread
+ *
+ */
+void* filter_thread(void* param){
+
+	filter_args* args = (filter_args*) param;
+	while(1==1){
+		sem_wait(args->filter_sem);//wait until the ADC is done
+		sem_wait(args->write_lock);
+
+
+		filter(args->data, args->coeficients);
+		fprintf(f, " %f ,", args->data->U[0]);
+		sem_post(args->write_lock);
+		sem_post(args->DAC_sem);
+	}
+
+	return 0;
+}
+
+/**
+ * DAC thread
+ *
+ */
+void* DAC_thread(void* param){
+	dac_args* args= (dac_args*) param;
+
+	while(1==1){
+		sem_wait(args->DAC_sem);
+		dac_output(args->data->U[0], args->handle);
+
+	}
+
+	return 0;
+}
+
+/**
  * This reads lines in the format "<var> <action> <value>", and action's
  * var by value.
- * 
+ *
  * valid vars:
- * 	p - proportional
- * 	i - integral
- *	d - derivative
- *	s - setpoint
+ * p - proportional
+ * i - integral
+ * d - derivative
+ * s - setpoint
  *
  * valid actions
- *	+ - increment
- *	- - decrement
- * 	= - set
+ * + - increment
+ * - - decrement
+ * = - set
  *
  * v_params should be a pointer to an input_thread_params struct
  */
 void * start_input_thread(void * v_params) {
-	input_thread_params * params = (input_thread_params *) v_params;
+	input_thread_args * params = (input_thread_args *) v_params;
 
 	char var;
 	char action;
@@ -149,97 +226,118 @@ void * start_input_thread(void * v_params) {
 
 	double * var_to_change;
 
-	while (true) {
+	while (1) {
 		sem_post(params->write_lock);
 
-		scanf("%c %c %f", &var, &action, &value);
+		printf(":");
+		var = getchar();
+		action = getchar();
+		scanf("%lf", &value);
+		while (getchar() != '\n'){}
 
 		sem_wait(params->write_lock);
 
 		// Get out the variable
 		switch(var){
-			case 'p': 
-				var_to_change = &(params->coefficient_struct->p); 
-				break;
-			case 'i': 
-				var_to_change = &(params->coefficient_struct->i); 
-				break;
-			case 'd': 
-				var_to_change = &(params->coefficient_struct->d); 
-				break;
-			case 's': 
-				var_to_change = &(params->coefficient_struct->setpoint); 
-				break;
-			default:
-				printf("Invalid variable\n");
-				continue;
+		case 'p':
+			var_to_change = &(params->coefficient_struct->p);
+			break;
+		case 'i':
+			var_to_change = &(params->coefficient_struct->i);
+			break;
+		case 'd':
+			var_to_change = &(params->coefficient_struct->d);
+			break;
+		case 's':
+			var_to_change = params->setpoint;
+			break;
+		default:
+			printf("Invalid variable\n");
+			continue;
 		}
 
 		// Perform the action
 		switch(action) {
-			case '+':
-				*var_to_change += value;
-				break;
-			case '-':
-				*var_to_change -= value;
-				break;
-			case '=':
-				*var_to_change = value;
-				break;
-			default:
-				printf("Invalid action\n");
-				continue;
+		case '+':
+			*var_to_change += value;
+			break;
+		case '-':
+			*var_to_change -= value;
+			break;
+		case '=':
+			*var_to_change = value;
+			break;
+		default:
+			printf("Invalid action\n");
+			continue;
 		}
+
+		printf("%c:%lf\r\n", var,*var_to_change);
 	}
 }
 
-/**
- * Thread wrapper function for filter thread, just runs filter with 
- * given parameters
- *
- * v_params should be a pointer to a filter_thread_params struct
- */
-void * start_filter_thread(void * v_params) {
-	filter_thread_params * params = (filter_thread_params *) v_params;
 
-	while(true) {
-		sem_wait(params->input_lock);
-
-		sem_wait(params->write_lock);
-
-		filter(params->data_struct, params->coefficient_struct);
-
-		sem_post(params->write_lock);
-
-		sem_post(params->output_lock);
-	}
-}
 
 /**
- * Thread wrapper function for output thread, just runs output when
- * semaphore charged.
+ * Schedules a periodic ATD conversion
  *
- * v_params should be a pointer to a output_thread_params struct
+ * @param interval nanosecond interval
+ *
  */
-void * start_output_thread(void * v_params) {
-	output_thread_params * params = (output_thread_params *) v_params;
+int scheduleATD(int interval, uintptr_t handle, adc_args* args){
+	struct sigevent event;
+	timer_t timer; //out value for timer create
+	struct itimerspec value;
 
-	while(true) {
-		sem_wait(params->output_lock);
 
-		dac_output(params->data_struct->U[0], params->handle);
-	}
+	SIGEV_THREAD_INIT(&event, &adc_callback,(void*)args, NULL );
+	timer_create(CLOCK_REALTIME, &event, &timer );
+
+	//set initial time
+	value.it_value.tv_nsec = interval;
+	value.it_value.tv_sec = 0;
+
+	//set reload time
+	value.it_interval.tv_nsec=interval;
+	value.it_interval.tv_sec=0;
+
+	//set up the timer and let it run
+	timer_settime(timer,0,&value,NULL);
+
+	return 0;
+
 }
 
 
 int main(int argc, char *argv[]) {
-	FILE * f = fopen("/tmp/data.csv", "w+");
+
+	char buf[20];
+	char file[10];
+	printf("log file?\r\n");
+	scanf("%s", file);
+	sprintf(buf,"/tmp/%s.csv",file);
+
+	f= fopen(buf, "w+");
 
 	uintptr_t ctrlHandle;
 
-	double y_next = 0, y_cur = 0, y_prev = 0;
-	double u_cur = 5, u_prev = 0;
-	int i;
+
+	filter_data data={{0,0,0},{0,0,0}};
+	coefs coefficients={2,.3,.1};
+	double setpoint=0;
+
+
+	sem_t filter_sem;
+	sem_t DAC_sem;
+	sem_t write_lock;
+
+	pthread_t filter_pthread;
+	pthread_t DAC_pthread;
+	pthread_t input_pthread;
+
+	sem_init(&filter_sem,0,0);
+	sem_init(&DAC_sem,0,0);
+	sem_init(&write_lock,0,0);
 
 	if (ThreadCtl(_NTO_TCTL_IO, NULL) == -1){
 		perror("Failed to get I/O access permission");
@@ -252,23 +350,28 @@ int main(int argc, char *argv[]) {
 		return 2;
 	}
 
+	//set up args for our ADC callback thread
+	adc_args adcargs={ctrlHandle, &data, &filter_sem, &DAC_sem, &setpoint};
+	filter_args filtargs={&data, &coefficients, &filter_sem, &write_lock, &DAC_sem};
+	dac_args dacargs={&data,ctrlHandle,&DAC_sem};
+	input_thread_args inputargs={&write_lock, &coefficients,&setpoint};
+
+	//reset DA converter
 	out8(ctrlHandle + DA_CMD, DA_CMD_RSTDA);
 
-	for (i = 0; i < 1000; i++) {
-		y_next = y_cur - .632 * y_prev + .368 * u_cur + .264 * u_prev;
+	printf("Sample freq?\r\n");
+	int freq;
+	scanf("%d",&freq);
 
-		fprintf(f, "%f, %f, %f, %f, %f\n", y_next, y_cur, y_prev, u_cur, u_prev);
-		printf("%f, %f, %f, %f, %f\n", y_next, y_cur, y_prev, u_cur, u_prev);
+	scheduleATD(1000000000/freq,ctrlHandle,&adcargs);
 
-		y_prev = y_cur;
-		y_cur = y_next;
-		u_prev= u_cur;
-		u_cur = 5;
+	pthread_create(&filter_pthread,NULL,&filter_thread,(void*)&filtargs);
+	pthread_create(&DAC_pthread,NULL,&DAC_thread,(void*)&dacargs);
+	pthread_create(&input_pthread,NULL, &start_input_thread, (void*)&inputargs);
 
-		dac_output(y_next, ctrlHandle);
-
-		usleep(100000);
-	}
+	pthread_join(filter_pthread,NULL);
+	pthread_join(DAC_pthread,NULL);
+	pthread_join(input_pthread,NULL);
 
 	return EXIT_SUCCESS;
 }
