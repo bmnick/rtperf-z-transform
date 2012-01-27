@@ -45,6 +45,7 @@
 
 //TODO: get rid of this
 FILE * f;
+int count = 0;
 
 
 
@@ -97,7 +98,7 @@ void dac_output(double value, uintptr_t handle) {
 
 	int output = value / 7 * 2048 + 2048;
 
-	fprintf(f,"%lf \r\n, ",value);
+	fprintf(f,"%lf \r\n",value);
 
 	out8(handle + DA_LSB, output & DA_LSB_MASK);
 	out8(handle + DA_MSB, ((output & DA_MSB_MASK) >> 8) | DA_MSB_CHANNEL_0);
@@ -141,6 +142,14 @@ void adc_callback(param){
 
 	//free up the filter semaphore to allow the filter to run to run
 	sem_post(args->filter_sem);
+
+	count++;
+	if (count==150){
+		printf("done\r\n");
+	}
+
+
+
 }
 
 
@@ -321,10 +330,18 @@ int main(int argc, char *argv[]) {
 
 	uintptr_t ctrlHandle;
 
-
 	filter_data data={{0,0,0},{0,0,0}};
 	coefs coefficients={2,.3,.1};
 	double setpoint=0;
+
+	printf("p:\r\n");
+	scanf("%lf", &coefficients.p);
+	printf("i:\r\n");
+	scanf("%lf", &coefficients.i);
+	printf("d:\r\n");
+	scanf("%lf", &coefficients.d);
+	printf("setpoint:\r\n");
+	scanf("%lf", &setpoint);
 
 
 	sem_t filter_sem;
