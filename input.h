@@ -5,11 +5,11 @@
 
 #include "filter.h"
 
-typedef struct{
+typedef struct input_thread_args {
 	sem_t * write_lock;
 	coefs * coefficient_struct;
 	double* setpoint;
-}input_thread_args;
+} input_thread_args;
 
 /**
  * This reads lines in the format "<var> <action> <value>", and action's

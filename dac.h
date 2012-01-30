@@ -24,7 +24,7 @@
  *
  * Contains all arguments needed by the DAC output thread on launch
  */
-typedef struct{
+typedef struct dac_args {
 	filter_data * data;
 
 	uintptr_t handle;

@@ -29,7 +29,7 @@
 #define AD_CMD 0
 #define AD_CMD_TRIGGER_READ (0x80)
 
-typedef struct {
+typedef struct adc_args {
 	uintptr_t handle;
 
 	filter_data* data;

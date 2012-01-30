@@ -5,23 +5,23 @@
 
 #include <semaphore.h>
 
-typedef struct { //0 is current time
+typedef struct filter_data { //0 is current time
 	double E[3]; //error (input to filter
 	double U[3]; //output
-}filter_data;
+} filter_data; 
 
-typedef struct {
+typedef struct coefs {
 	double p,i,d;
 } coefs;
 
-typedef struct{
+typedef struct filter_args {
 	filter_data* data;
 	coefs* coeficients;
 	sem_t* filter_sem;
 	sem_t* write_lock;
 	sem_t* DAC_sem;
 	FILE * f;
-}filter_args;
+} filter_args;
 
 double filter(filter_data * in, coefs * c);
 
